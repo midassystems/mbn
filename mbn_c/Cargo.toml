@@ -1,0 +1,16 @@
+[package]
+name = "mbn_c"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["staticlib"] # for .a static lib
+
+
+[dependencies]
+mbn = {path = "../mbn"}
+libc ="0.2.168"
+cbindgen = { version = "0.27.0" }
+
+[build-dependencies]
+cbindgen = { version = "0.27.0", default-features = false }
