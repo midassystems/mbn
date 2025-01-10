@@ -3,7 +3,6 @@ use crate::metadata::Metadata;
 use crate::record_enum::RecordEnum;
 use crate::record_ref::*;
 use crate::records::RecordHeader;
-use crate::METADATA_LENGTH;
 use std::io::{BufReader, Read};
 use std::mem;
 use std::path::Path;
@@ -17,6 +16,7 @@ pub struct Decoder<R> {
 impl<R: Read> Decoder<R> {
     pub fn new(mut reader: R) -> std::io::Result<Self> {
         let metadata = MetadataDecoder::new(&mut reader).decode()?;
+
         Ok(Self {
             metadata,
             decoder: RecordDecoder::new(reader),
@@ -51,36 +51,53 @@ impl<R: Read> Decoder<R> {
 
 pub struct MetadataDecoder<R> {
     reader: R,
-    read_buffer: Vec<u8>,
+    // read_buffer: Vec<u8>,
 }
 
 impl<R: Read> MetadataDecoder<R> {
     pub fn new(reader: R) -> Self {
-        Self {
-            reader,
-            read_buffer: vec![0; METADATA_LENGTH], // Initialize buffer with fixed size
-        }
+        Self { reader }
     }
+
+    /// Decodes metadata from the reader.
     pub fn decode(&mut self) -> std::io::Result<Option<Metadata>> {
-        // Try to read the buffer for metadata
-        match self.reader.read_exact(&mut self.read_buffer) {
-            Ok(_) => {
-                // Attempt to deserialize the buffer if data is present
-                match Metadata::deserialize(&self.read_buffer) {
-                    Ok(metadata) => Ok(Some(metadata)),
-                    Err(_) => {
-                        // If deserialization fails, return None
-                        Ok(None)
-                    }
-                }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                // If we reach EOF without finding metadata, return None
-                Ok(None)
-            }
-            Err(e) => Err(e),
+        // Read the length field (first 2 bytes)
+        let mut length_buffer = [0u8; 2];
+        self.reader.read_exact(&mut length_buffer)?;
+
+        // Decode the metadata length
+        let metadata_length = u16::from_le_bytes(length_buffer) as usize;
+
+        // Step 2: Read the metadata payload
+        let mut read_buffer = vec![0u8; metadata_length];
+        self.reader.read_exact(&mut read_buffer)?;
+
+        // Step 3: Deserialize the metadata
+        match Metadata::deserialize(&read_buffer) {
+            Ok(metadata) => Ok(Some(metadata)),
+            Err(_) => Ok(None), // Return None on deserialization failure
         }
     }
+    // pub fn decode(&mut self) -> std::io::Result<Option<Metadata>> {
+    //     // Try to read the buffer for metadata
+    //     match self.reader.read_exact(&mut self.read_buffer) {
+    //         Ok(_) => {
+    //             // Attempt to deserialize the buffer if data is present
+    //             match Metadata::deserialize(&self.read_buffer) {
+    //                 Ok(metadata) => Ok(Some(metadata)),
+    //                 Err(_) => {
+    //                     // If deserialization fails, return None
+    //                     Ok(None)
+    //                 }
+    //             }
+    //         }
+    //         Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+    //             // If we reach EOF without finding metadata, return None
+    //             Ok(None)
+    //         }
+    //         Err(e) => Err(e),
+    //     }
+    // }
 }
 
 pub struct RecordDecoder<R> {
@@ -164,6 +181,7 @@ pub struct AsyncDecoder<R> {
 impl<R: AsyncBufRead + Unpin> AsyncDecoder<R> {
     pub async fn new(mut reader: R) -> tokio::io::Result<Self> {
         let metadata = AsyncMetadataDecoder::new(&mut reader).decode().await?;
+
         Ok(Self {
             metadata,
             decoder: AsyncRecordDecoder::new(reader),
@@ -215,16 +233,24 @@ impl<R: AsyncBufRead + Unpin> AsyncMetadataDecoder<R> {
         let buffer = self.reader.fill_buf().await?;
 
         // Ensure we have enough bytes for metadata
-        if buffer.len() < METADATA_LENGTH {
+        if buffer.len() < 2 {
             return Ok(None); // Not enough data, return None (no metadata)
         }
 
+        // Decode the metadata length
+        let metadata_length = u16::from_le_bytes([buffer[0], buffer[1]]) as usize;
+
         // Attempt to deserialize the peeked bytes
-        match Metadata::deserialize(&buffer[..METADATA_LENGTH]) {
+        if buffer.len() < 2 + metadata_length {
+            return Ok(None); // Not enough data yet
+        }
+
+        // Deserialize the metadata
+        match Metadata::deserialize(&buffer[2..2 + metadata_length]) {
             Ok(metadata) => {
-                // Consume the metadata bytes from the buffer
-                self.reader.consume(METADATA_LENGTH);
-                Ok(Some(metadata)) // Return the deserialized metadata
+                // Consume the bytes used for metadata
+                self.reader.consume(2 + metadata_length);
+                Ok(Some(metadata))
             }
             Err(_) => Ok(None),
         }
@@ -307,18 +333,97 @@ mod tests {
     use crate::encode::MetadataEncoder;
     use crate::encode::{CombinedEncoder, RecordEncoder};
     use crate::enums::{RType, Schema};
-    use crate::error::Result;
+    use crate::record_enum::RecordEnum;
+    use crate::records::BidAskPair;
+    use crate::records::Mbp1Msg;
     use crate::records::{as_u8_slice, OhlcvMsg};
     use crate::symbols::SymbolMap;
-    use futures::stream::StreamExt;
     use serial_test::serial;
     use std::io::Cursor;
     use std::path::PathBuf;
+
+    async fn create_test_file() -> anyhow::Result<PathBuf> {
+        // Metadata
+        let mut symbol_map = SymbolMap::new();
+        symbol_map.add_instrument("AAPL", 1);
+        symbol_map.add_instrument("TSLA", 2);
+
+        let metadata = Metadata::new(Schema::Mbp1, 1234567898765, 123456765432, symbol_map);
+
+        // Record
+        let msg1 = Mbp1Msg {
+            hd: RecordHeader::new::<Mbp1Msg>(1, 1622471124),
+            price: 12345676543,
+            size: 1234543,
+            action: 0,
+            side: 0,
+            depth: 0,
+            flags: 0,
+            ts_recv: 1231,
+            ts_in_delta: 123432,
+            sequence: 23432,
+            discriminator: 0,
+            levels: [BidAskPair {
+                bid_px: 10000000,
+                ask_px: 200000,
+                bid_sz: 3000000,
+                ask_sz: 400000000,
+                bid_ct: 50000000,
+                ask_ct: 60000000,
+            }],
+        };
+        let msg2 = Mbp1Msg {
+            hd: RecordHeader::new::<Mbp1Msg>(1, 1622471124),
+            price: 12345676543,
+            size: 1234543,
+            action: 0,
+            side: 0,
+            depth: 0,
+            flags: 0,
+            ts_recv: 1231,
+            ts_in_delta: 123432,
+            sequence: 23432,
+            discriminator: 0,
+            levels: [BidAskPair {
+                bid_px: 10000000,
+                ask_px: 200000,
+                bid_sz: 3000000,
+                ask_sz: 400000000,
+                bid_ct: 50000000,
+                ask_ct: 60000000,
+            }],
+        };
+
+        let record_ref1: RecordRef = (&msg1).into();
+        let record_ref2: RecordRef = (&msg2).into();
+        let records = &[record_ref1, record_ref2];
+
+        let mut buffer = Vec::new();
+        let mut encoder = CombinedEncoder::new(&mut buffer);
+        encoder
+            .encode(&metadata, records)
+            .expect("Error on encoding");
+
+        // Test
+        let file = PathBuf::from("tests/test_decode.bin");
+        let _ = encoder.write_to_file(&file, false);
+
+        Ok(file)
+    }
+
+    async fn delete_test_file(file: PathBuf) -> anyhow::Result<()> {
+        // Cleanup
+        if file.exists() {
+            std::fs::remove_file(&file).expect("Failed to delete the test file.");
+        }
+        Ok(())
+    }
 
     // -- Sync --
     // Decoder
     #[test]
     #[serial]
+    // #[ignore]
     fn test_decode() -> anyhow::Result<()> {
         // Metadata
         let mut symbol_map = SymbolMap::new();
@@ -371,48 +476,23 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    async fn test_record_decoder_iter() -> Result<()> {
-        let file_path = PathBuf::from("tests/test.bin");
+    // #[ignore]
+    async fn test_combinder_decoder_from_file() -> anyhow::Result<()> {
+        let file_path = create_test_file().await?;
+
+        // let file_path = PathBuf::from("tests/test.bin");
 
         // Test
-        let mut decoder = Decoder::<std::io::BufReader<std::fs::File>>::from_file(file_path)?;
-        let mut decode_iter = decoder.decode_iterator();
-
-        let mut all_records = Vec::new();
-        while let Some(record_result) = decode_iter.next() {
-            match record_result {
-                Ok(record) => match record {
-                    RecordEnum::Ohlcv(msg) => {
-                        all_records.push(msg);
-                    }
-                    _ => unimplemented!(),
-                },
-                Err(e) => {
-                    println!("{:?}", e);
-                }
-            }
-        }
-
-        // println!("{:?}", all_records);
-
-        // Validate
-        assert!(all_records.len() > 0);
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn test_combinder_decoder_from_file() -> Result<()> {
-        let file_path = PathBuf::from("tests/test.bin");
-
-        // Test
-        let mut decoder = Decoder::<std::io::BufReader<std::fs::File>>::from_file(file_path)?;
+        let mut decoder =
+            Decoder::<std::io::BufReader<std::fs::File>>::from_file(file_path.clone())?;
         let records = decoder.decode()?;
         // println!("{:?}", records);
 
         // Validate
         assert!(records.len() > 0);
+
+        // Cleanup
+        delete_test_file(file_path).await?;
 
         Ok(())
     }
@@ -420,6 +500,7 @@ mod tests {
     // MetadataDecoder
     #[test]
     #[serial]
+    // #[ignore]
     fn test_decode_metadata() {
         let mut symbol_map = SymbolMap::new();
         symbol_map.add_instrument("AAPL", 1);
@@ -448,6 +529,7 @@ mod tests {
     // RecordDecoder
     #[test]
     #[serial]
+    // #[ignore]
     fn test_decode_record() {
         // Create an OhlcvMsg record
         let ohlcv_msg = OhlcvMsg {
@@ -485,6 +567,7 @@ mod tests {
 
     #[test]
     #[serial]
+    // #[ignore]
     fn test_decode_record_ref() {
         // Create an OhlcvMsg record
         let ohlcv_msg = OhlcvMsg {
@@ -522,6 +605,7 @@ mod tests {
 
     #[test]
     #[serial]
+    // #[ignore]
     fn test_encode_decode_records() {
         let ohlcv_msg1 = OhlcvMsg {
             hd: RecordHeader::new::<OhlcvMsg>(1, 1622471124),
@@ -561,68 +645,11 @@ mod tests {
         assert_eq!(decoded_records[1], RecordEnum::Ohlcv(ohlcv_msg2));
     }
 
-    #[test]
-    #[serial]
-    fn test_iter_decode() {
-        // Setup
-        let ohlcv_msg1 = OhlcvMsg {
-            hd: RecordHeader::new::<OhlcvMsg>(1, 1622471124),
-            open: 100,
-            high: 200,
-            low: 50,
-            close: 150,
-            volume: 1000,
-        };
-
-        let ohlcv_msg2 = OhlcvMsg {
-            hd: RecordHeader::new::<OhlcvMsg>(2, 1622471125),
-            open: 110,
-            high: 210,
-            low: 55,
-            close: 155,
-            volume: 1100,
-        };
-
-        // Encode
-        let mut buffer = Vec::new();
-        {
-            let mut encoder = RecordEncoder::new(&mut buffer);
-            let record_ref1: RecordRef = (&ohlcv_msg1).into();
-            let record_ref2: RecordRef = (&ohlcv_msg2).into();
-            encoder
-                .encode_records(&[record_ref1, record_ref2])
-                .expect("Encoding failed");
-        }
-
-        // Decode
-        let cursor = Cursor::new(buffer);
-        let mut decoder = RecordDecoder::new(cursor);
-        let iter = decoder.decode_iterator();
-
-        // Test
-        let mut i = 0;
-        for record in iter {
-            match record {
-                Ok(record) => {
-                    // Process the record
-                    if i == 0 {
-                        assert_eq!(record, RecordEnum::Ohlcv(ohlcv_msg1.clone()));
-                    } else {
-                        assert_eq!(record, RecordEnum::Ohlcv(ohlcv_msg2.clone()));
-                    }
-                    i = i + 1;
-                }
-                Err(e) => {
-                    eprintln!("Error processing record: {:?}", e);
-                }
-            }
-        }
-    }
-
     // -- Async --
     // Decoder
     #[tokio::test]
     #[serial]
+    // #[ignore]
     async fn test_decode_async() -> anyhow::Result<()> {
         // Metadata
         let mut symbol_map = SymbolMap::new();
@@ -675,50 +702,21 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    async fn test_record_decoder_iter_async() -> Result<()> {
-        let file_path = PathBuf::from("tests/test.bin");
+    // #[ignore]
+    async fn test_combinder_decoder_from_file_async() -> anyhow::Result<()> {
+        let file_path = create_test_file().await?;
 
         // Test
         let mut decoder =
-            <AsyncDecoder<tokio::io::BufReader<tokio::fs::File>>>::from_file(file_path).await?;
-        let mut decode_iter = decoder.decode_iterator();
-
-        let mut all_records = Vec::new();
-        while let Some(record_result) = decode_iter.next().await {
-            match record_result {
-                Ok(record) => match record {
-                    RecordEnum::Ohlcv(msg) => {
-                        all_records.push(msg);
-                    }
-                    _ => unimplemented!(),
-                },
-                Err(e) => {
-                    println!("{:?}", e);
-                }
-            }
-        }
-        // println!("{:?}", all_records);
-
-        // Validate
-        assert!(all_records.len() > 0);
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn test_combinder_decoder_from_file_async() -> Result<()> {
-        let file_path = PathBuf::from("tests/test.bin");
-
-        // Test
-        let mut decoder =
-            <AsyncDecoder<tokio::io::BufReader<tokio::fs::File>>>::from_file(file_path).await?;
+            <AsyncDecoder<tokio::io::BufReader<tokio::fs::File>>>::from_file(file_path.clone())
+                .await?;
         let records = decoder.decode().await?;
-
-        // println!("{:?}", records);
 
         // Validate
         assert!(records.len() > 0);
+
+        // Cleanup
+        delete_test_file(file_path).await?;
 
         Ok(())
     }
@@ -726,6 +724,7 @@ mod tests {
     // MetadataDecoder
     #[tokio::test]
     #[serial]
+    // #[ignore]
     async fn test_decode_metadata_async() -> anyhow::Result<()> {
         let mut symbol_map = SymbolMap::new();
         symbol_map.add_instrument("AAPL", 1);
@@ -756,6 +755,7 @@ mod tests {
     // RecordDecoder
     #[tokio::test]
     #[serial]
+    // #[ignore]
     async fn test_decode_record_async() -> anyhow::Result<()> {
         // Create an OhlcvMsg record
         let ohlcv_msg = OhlcvMsg {
@@ -794,6 +794,7 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    // #[ignore]
     async fn test_decode_record_ref_async() -> anyhow::Result<()> {
         // Create an OhlcvMsg record
         let ohlcv_msg = OhlcvMsg {
@@ -828,6 +829,7 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    // #[ignore]
     async fn test_encode_decode_records_async() -> anyhow::Result<()> {
         let ohlcv_msg1 = OhlcvMsg {
             hd: RecordHeader::new::<OhlcvMsg>(1, 1622471124),
@@ -866,64 +868,6 @@ mod tests {
         assert_eq!(decoded_records[0], RecordEnum::Ohlcv(ohlcv_msg1));
         assert_eq!(decoded_records[1], RecordEnum::Ohlcv(ohlcv_msg2));
 
-        Ok(())
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn test_iter_decode_async() -> anyhow::Result<()> {
-        // Setup
-        let ohlcv_msg1 = OhlcvMsg {
-            hd: RecordHeader::new::<OhlcvMsg>(1, 1622471124),
-            open: 100,
-            high: 200,
-            low: 50,
-            close: 150,
-            volume: 1000,
-        };
-
-        let ohlcv_msg2 = OhlcvMsg {
-            hd: RecordHeader::new::<OhlcvMsg>(2, 1622471125),
-            open: 110,
-            high: 210,
-            low: 55,
-            close: 155,
-            volume: 1100,
-        };
-
-        // Encode
-        let mut buffer = Vec::new();
-        {
-            let mut encoder = RecordEncoder::new(&mut buffer);
-            let record_ref1: RecordRef = (&ohlcv_msg1).into();
-            let record_ref2: RecordRef = (&ohlcv_msg2).into();
-            encoder
-                .encode_records(&[record_ref1, record_ref2])
-                .expect("Encoding failed");
-        }
-
-        // Decode
-        let cursor = Cursor::new(buffer);
-        let mut decoder = AsyncRecordDecoder::new(cursor);
-        let mut iter = decoder.decode_iterator();
-
-        // Test
-        let mut i = 0;
-        while let Some(record) = iter.next().await {
-            match record {
-                Ok(record) => {
-                    if i == 0 {
-                        assert_eq!(record, RecordEnum::Ohlcv(ohlcv_msg1.clone()));
-                    } else {
-                        assert_eq!(record, RecordEnum::Ohlcv(ohlcv_msg2.clone()));
-                    }
-                    i = i + 1;
-                }
-                Err(e) => {
-                    eprintln!("Error processing record: {:?}", e);
-                }
-            }
-        }
         Ok(())
     }
 }

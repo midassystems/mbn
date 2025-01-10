@@ -1,6 +1,5 @@
 use crate::metadata::Metadata;
 use crate::record_ref::*;
-use crate::METADATA_LENGTH;
 use std::fs::OpenOptions;
 use std::io::{self, Write};
 use std::path::Path;
@@ -59,23 +58,34 @@ impl<W: Write> CombinedEncoder<W> {
 
 pub struct MetadataEncoder<W> {
     writer: W,
-    buffer: Vec<u8>,
+    // buffer: Vec<u8>,
 }
 
 impl<W: Write> MetadataEncoder<W> {
     pub fn new(writer: W) -> Self {
-        MetadataEncoder {
-            writer,
-            buffer: vec![0; METADATA_LENGTH], // Initialize buffer with fixed size
-        }
+        MetadataEncoder { writer }
     }
 
     pub fn encode_metadata(&mut self, metadata: &Metadata) -> io::Result<()> {
-        let serialized = metadata.serialize();
-        self.buffer[..serialized.len()].copy_from_slice(&serialized);
-        self.writer.write_all(&self.buffer)?;
+        let bytes = metadata.serialize();
+
+        // Calculate and prepend the length
+        let length: u16 = bytes.len() as u16;
+        let mut buffer = Vec::with_capacity(length as usize + 2);
+
+        // Add length as the first 2 bytes
+        buffer.extend_from_slice(&length.to_le_bytes());
+        buffer.extend_from_slice(&bytes);
+
+        // Write the buffer to the writer
+        self.writer.write_all(&buffer)?;
         self.writer.flush()?;
         Ok(())
+
+        // self.buffer[..serialized.len()].copy_from_slice(&serialized);
+        // self.writer.write_all(&self.buffer)?;
+        // self.writer.flush()?;
+        // Ok(())
     }
 }
 
@@ -351,7 +361,10 @@ mod tests {
             .expect("Error metadata encoding.");
 
         // Validate
-        let decoded = Metadata::deserialize(&buffer)?;
+        let length_buffer: [u8; 2] = buffer[..2].try_into()?;
+        let metadata_length = u16::from_le_bytes(length_buffer) as usize;
+        let bytes = &buffer[2..2 + metadata_length];
+        let decoded = Metadata::deserialize(&bytes)?;
         assert_eq!(decoded.schema, metadata.schema);
         assert_eq!(decoded.start, metadata.start);
         assert_eq!(decoded.end, metadata.end);

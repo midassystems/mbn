@@ -1,4 +1,4 @@
-pub const METADATA_LENGTH: usize = 100;
+pub const METADATA_LENGTH_MULTIPLIER: u8 = 4;
 pub const PRICE_SCALE: i64 = 1_000_000_000;
 pub mod backtest;
 pub mod backtest_decoder;
